@@ -1,0 +1,75 @@
+# .golangci.yml — calcado de wapp-shared. Probado con golangci-lint v2.12.2.
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  enable:
+    # Defectos (habilitados por defecto)
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+
+    # Estilo
+    - nakedret
+
+    # Performance
+    - prealloc
+
+    # Seguridad
+    - gosec
+
+    # Complejidad
+    - gocyclo
+    - gocritic
+
+    # Documentación
+    - revive
+
+    # Errores
+    - errorlint
+    - errname
+
+    # Buenas prácticas
+    - contextcheck
+    - nilerr
+    - nilnil
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+      exclude-functions:
+        # Permitir ignorar errores en tests para setup/teardown
+        - (io.Closer).Close
+
+    gocyclo:
+      min-complexity: 15
+
+    revive:
+      rules:
+        - name: exported
+          severity: warning
+        - name: blank-imports
+          severity: warning
+        - name: context-as-argument
+          severity: warning
+        - name: error-return
+          severity: warning
+        - name: error-strings
+          severity: warning
+        - name: error-naming
+          severity: warning
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+issues:
+  max-issues-per-linter: 50
+  max-same-issues: 10

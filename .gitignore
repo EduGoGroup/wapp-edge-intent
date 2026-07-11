@@ -1,0 +1,28 @@
+# Binarios compilados
+/wapp-edge-intent
+*.exe
+*.exe~
+*.test
+*.out
+
+# Directorios de salida
+bin/
+dist/
+
+# Entornos y secretos
+.env
+.env.*
+!.env.example
+
+# go workspace — SOLO desarrollo local (overlay de wapp-shared sin publicar)
+go.work
+go.work.sum
+
+# macOS
+.DS_Store
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
