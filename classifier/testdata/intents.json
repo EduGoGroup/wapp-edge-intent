@@ -1,0 +1,82 @@
+{
+  "version": "battery-1",
+  "umbral_confianza": 0.6,
+  "vocabulario": ["pizza", "pepperoni", "margarita", "pedido", "carrito", "saldo"],
+  "intents": [
+    {
+      "name": "crear_pedido",
+      "descripcion": "El cliente quiere pedir uno o varios productos",
+      "params": ["producto", "cantidad"],
+      "ejemplos": [
+        { "mensaje": "quiero 2 pizzas margarita", "params": { "producto": "pizza margarita", "cantidad": "2" } },
+        { "mensaje": "me mandas una hamburguesa", "params": { "producto": "hamburguesa", "cantidad": "1" } }
+      ]
+    },
+    {
+      "name": "estado_pedido",
+      "descripcion": "El cliente pregunta por el estado o la ubicación de un pedido existente",
+      "params": ["numero_pedido"],
+      "ejemplos": [
+        { "mensaje": "donde va mi pedido 1234", "params": { "numero_pedido": "1234" } },
+        { "mensaje": "que paso con mi orden", "params": {} }
+      ]
+    },
+    {
+      "name": "horario_atencion",
+      "descripcion": "El cliente pregunta a qué hora abren o cierran",
+      "ejemplos": [
+        { "mensaje": "a que hora abren hoy" },
+        { "mensaje": "estan abiertos ahorita" }
+      ]
+    },
+    {
+      "name": "hablar_humano",
+      "descripcion": "El cliente pide hablar con una persona o un agente",
+      "ejemplos": [
+        { "mensaje": "quiero hablar con alguien" },
+        { "mensaje": "me pasas con un agente" }
+      ]
+    },
+    {
+      "name": "listar_productos",
+      "descripcion": "El cliente quiere ver el catálogo o la lista de productos",
+      "ejemplos": [
+        { "mensaje": "que tienen para vender" },
+        { "mensaje": "muestrame el menu" }
+      ]
+    },
+    {
+      "name": "precio_producto",
+      "descripcion": "El cliente pregunta el precio de un producto concreto",
+      "params": ["producto"],
+      "ejemplos": [
+        { "mensaje": "cuanto vale la hamburguesa", "params": { "producto": "hamburguesa" } },
+        { "mensaje": "precio de las papas", "params": { "producto": "papas" } }
+      ]
+    },
+    {
+      "name": "ver_carrito",
+      "descripcion": "El cliente quiere ver lo que lleva en su carrito",
+      "ejemplos": [
+        { "mensaje": "que llevo en el carrito" },
+        { "mensaje": "muestrame mi pedido actual" }
+      ]
+    },
+    {
+      "name": "confirmar_pedido",
+      "descripcion": "El cliente confirma o cierra su pedido para pagarlo",
+      "ejemplos": [
+        { "mensaje": "confirmo mi compra" },
+        { "mensaje": "cierra el pedido y cobrame" }
+      ]
+    },
+    {
+      "name": "consultar_saldo",
+      "descripcion": "El cliente pregunta cuánto saldo o crédito tiene",
+      "ejemplos": [
+        { "mensaje": "cuanto credito me queda" },
+        { "mensaje": "que saldo tengo disponible" }
+      ]
+    }
+  ]
+}
