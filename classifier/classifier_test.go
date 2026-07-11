@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -66,11 +67,11 @@ func TestBuildSchemaParamsAreFreeNotProperties(t *testing.T) {
 	}
 
 	// El enum debe incluir cada intent del contrato + el reservado "desconocido".
-	if !contains(s.Properties.Intent.Enum, intents.ReservedUnknown) {
+	if !slices.Contains(s.Properties.Intent.Enum, intents.ReservedUnknown) {
 		t.Error("el enum de intent debe incluir 'desconocido'")
 	}
 	for _, in := range cfg.Intents {
-		if !contains(s.Properties.Intent.Enum, in.Name) {
+		if !slices.Contains(s.Properties.Intent.Enum, in.Name) {
 			t.Errorf("el enum no incluye el intent %q", in.Name)
 		}
 	}
@@ -249,15 +250,6 @@ func TestReloadSwapsConfig(t *testing.T) {
 }
 
 // --- helpers ---
-
-func contains(xs []string, v string) bool {
-	for _, x := range xs {
-		if x == v {
-			return true
-		}
-	}
-	return false
-}
 
 func equalMap(a, b map[string]string) bool {
 	if len(a) != len(b) {

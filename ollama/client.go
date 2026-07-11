@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 )
@@ -164,12 +165,7 @@ func (c *Client) SupportsThinking(ctx context.Context, model string) bool {
 		c.caps[model] = caps
 		c.mu.Unlock()
 	}
-	for _, cap := range caps {
-		if cap == "thinking" {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(caps, "thinking")
 }
 
 // fetchCapabilities pregunta a /api/show las capabilities de un modelo.
