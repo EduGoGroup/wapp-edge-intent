@@ -1,4 +1,8 @@
-.PHONY: build test test-race vet fmt lint check battery
+.PHONY: build test test-race vet fmt lint check battery ci-local ci-docker
+
+# Versiones fijadas del toolchain de CI (deben coincidir con .github/workflows/ci.yml)
+GO_VERSION := 1.26.5
+LINT_VERSION := v2.12.2
 
 # Compila todos los paquetes.
 build:
@@ -31,3 +35,17 @@ check: fmt vet test-race lint
 # Corre solo la batería de validación contra Ollama (requiere el modelo cargado).
 battery:
 	go test ./classifier -run TestBattery -count=1 -v
+
+# --- Red local de CI (réplica de .github/workflows/ci.yml) ---
+
+# Pre-push: agregado de gates locales antes de mergear (== check + build).
+ci-local: fmt vet lint test-race build
+
+# Simula el CI en Docker (Go $(GO_VERSION) + golangci-lint $(LINT_VERSION)) — requiere Docker.
+ci-docker:
+	@docker run --rm \
+		-e GOFLAGS=-buildvcs=false \
+		-v "$$(go env GOPATH)/pkg/mod:/go/pkg/mod" \
+		-v "$(CURDIR):/workspace" -w /workspace \
+		golang:$(GO_VERSION)-bookworm \
+		bash -c "set -e; curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b /usr/local/bin $(LINT_VERSION) && make ci-local"
