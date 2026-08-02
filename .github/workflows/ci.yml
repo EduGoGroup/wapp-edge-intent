@@ -1,18 +1,18 @@
 name: CI
 
-# CI de PR/push para wapp-edge-intent (módulo Go único, público).
-# Calcado del patrón de wapp-cloudlink. La batería contra Ollama real se salta
-# sola en CI (no hay modelo cargado), así que `go test` corre solo lo unitario.
-# Módulos wApp públicos: sin GOPRIVATE ni token. El contrato de intents se
-# consume por réplica local (replace en go.mod) hasta cortar intents/v0.1.0.
+# CI de wapp-edge-intent (módulo Go único, público).
+# Régimen local (2026-08-01): la validación continua vive en la Mac de
+# desarrollo (`make ci-local` / `make ci-docker`, Go 1.26.5 + golangci-lint
+# v2.12.2 fijados), no en Actions. Este workflow queda para corridas
+# manuales (release futuro) — no se dispara con push ni pull_request.
+# La batería contra Ollama real se salta sola en CI (no hay modelo cargado),
+# así que `go test` corre solo lo unitario. Módulos wApp públicos: sin
+# GOPRIVATE ni token.
 on:
-  pull_request:
-    branches: [main, dev]
-  push:
-    branches: [main] # red de seguridad
+  workflow_dispatch:
 
 env:
-  GO_VERSION: '1.26'
+  GO_VERSION: '1.26.5'
 
 jobs:
   test:
@@ -61,7 +61,7 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v7
+        uses: golangci/golangci-lint-action@v9
         with:
           # v2.4.0 no carga con Go 1.26; se fija v2.12.2 (probado local).
           version: v2.12.2
