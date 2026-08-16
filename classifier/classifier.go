@@ -17,6 +17,61 @@ import (
 	"github.com/EduGoGroup/wapp-shared/intents"
 )
 
+// Techo de entrada y opciones del modelo (Plan 051 · T2.5).
+//
+// Son constantes exportadas a propósito: el caller (el worker cajero del Edge)
+// las necesita para su config y NO debe duplicar los números a ciegas.
+const (
+	// DefaultMaxRunes es el techo de entrada por defecto, en RUNAS (no bytes):
+	// el texto que se manda al modelo se recorta a este tamaño.
+	//
+	// POR QUÉ EXISTE: sin techo, un mensaje de ~65 KB pegado en un chat tarda lo
+	// bastante como para contar fallos y abrir el circuit breaker compartido del
+	// Edge, apagando el clasificador de TODAS las sesiones. Es la vía más barata
+	// de denegar el servicio desde fuera, y no cuesta nada cerrarla.
+	//
+	// POR QUÉ 4000: un pedido real de WhatsApp cabe de sobra (los mensajes de
+	// negocio viven en cientos de caracteres, y el lote que concatena el cajero
+	// rara vez pasa del millar); 4000 runas de español son ~1000–1300 tokens, que
+	// entran holgados en DefaultNumCtx junto al prompt de sistema.
+	DefaultMaxRunes = 4000
+
+	// DefaultNumThread es el número de hilos de inferencia.
+	//
+	// POR QUÉ 5: lo fijó la medición de la O0 del Plan 051 sobre el VPS AMD real
+	// (el ADR-0038 §3 y el design §4 decían «2» y quedaron corregidos). NO se
+	// re-discute aquí: si hay que cambiarlo, se cambia midiendo, no opinando.
+	DefaultNumThread = 5
+
+	// DefaultNumCtx es la ventana de contexto pedida a Ollama, en tokens.
+	//
+	// POR QUÉ 4096: tiene que caber el prompt de sistema (que se regenera desde el
+	// contrato: intenciones + vocabulario + few-shots; ~600–1500 tokens para un
+	// contrato rico) MÁS el techo de entrada (~1000–1300 tokens para 4000 runas de
+	// español) MÁS la respuesta (DefaultNumPredict). El peor caso realista queda
+	// cerca de 3000, dentro de 4096.
+	//
+	// Se manda EXPLÍCITO para no depender del default del build de Ollama ni del
+	// Modelfile del modelo, que cambian entre versiones. Y hace de segundo techo:
+	// aunque el techo de runas fallara, el costo de una inferencia queda acotado.
+	//
+	// Subirlo cuesta RAM permanente en la caja del cliente (la KV cache crece
+	// lineal con num_ctx: ~0,5 GB en qwen3:1.7b a 4096, el doble a 8192), por eso
+	// no se sube «por si acaso». Una entrada patológica de 4000 runas CJK sí podría
+	// desbordar: Ollama recorta por la izquierda, el modelo devuelve algo ilegible y
+	// la clasificación degrada a "desconocido" — degradación segura, no caída.
+	DefaultNumCtx = 4096
+
+	// DefaultNumPredict es el máximo de tokens que el modelo puede generar.
+	//
+	// POR QUÉ 256: la salida es un JSON corto y de forma fija
+	// ({intent, confidence, params}), que medido ronda los 30–60 tokens; 256 deja
+	// 4–8× de margen para una intención con varios params largos y, sobre todo,
+	// acota una generación desbocada (un modelo pequeño que entra en bucle ante
+	// una entrada degenerada no puede quemar tiempo sin límite).
+	DefaultNumPredict = 256
+)
+
 // llmClient es la dependencia del clasificador hacia el LLM local. La cumple
 // *ollama.Client; se declara como interfaz para desacoplar y poder mockear.
 type llmClient interface {
@@ -24,14 +79,51 @@ type llmClient interface {
 	SupportsThinking(ctx context.Context, model string) bool
 }
 
+// Metrics es el costo de una inferencia, tal y como lo reporta Ollama. El
+// clasificador la propaga en cada Classification para que el caller la registre
+// (log Info / contador local); antes se calculaba y se tiraba (Plan 051 · T2.6).
+//
+// Se declara aquí, y no se reexporta ollama.Metrics, para que el consumidor del
+// clasificador no tenga que importar el paquete ollama.
+type Metrics struct {
+	TotalMs      int64   `json:"total_ms"`
+	LoadMs       int64   `json:"load_ms"`
+	PromptTokens int     `json:"prompt_tokens"`
+	OutputTokens int     `json:"output_tokens"`
+	TokensPerSec float64 `json:"tokens_per_sec"`
+}
+
+// metricsFrom traduce las métricas del cliente de Ollama al tipo público.
+func metricsFrom(m ollama.Metrics) Metrics {
+	return Metrics{
+		TotalMs:      m.TotalMs,
+		LoadMs:       m.LoadMs,
+		PromptTokens: m.PromptTokens,
+		OutputTokens: m.OutputTokens,
+		TokensPerSec: m.TokensPerSec,
+	}
+}
+
 // Classification es el contrato de salida del clasificador: la intención elegida,
-// los parámetros extraídos (ya saneados) y la confianza del modelo. NO lleva
-// texto de respuesta: en wApp la respuesta al cliente la produce el Cloud (Motor
-// de Flujos), nunca el LLM del Edge.
+// los parámetros extraídos (ya saneados), la confianza del modelo y el costo de la
+// inferencia. NO lleva texto de respuesta: en wApp la respuesta al cliente la
+// produce el Cloud (Motor de Flujos), nunca el LLM del Edge. Tampoco lleva el
+// texto clasificado (INV-051.1): el caller puede loguear esta struct entera.
 type Classification struct {
 	Intent     string            `json:"intent"`
 	Params     map[string]string `json:"params"`
 	Confidence float64           `json:"confidence"`
+
+	// Metrics es el costo de la inferencia (total_ms, tokens). Viene poblada
+	// también en las salidas degradadas ("desconocido"): el caller quiere medir
+	// justo esos casos.
+	Metrics Metrics `json:"metrics"`
+
+	// Truncado indica que el texto de entrada superaba el techo de runas y se
+	// recortó antes de mandarlo al modelo. Es observable a propósito: el Edge lo
+	// loguea, y un Truncado crónico significa que el techo está mal calibrado
+	// para ese tenant (o que alguien está probando a tumbar el clasificador).
+	Truncado bool `json:"truncado"`
 }
 
 // Classifier clasifica mensajes contra un contrato de intenciones dado.
@@ -39,16 +131,75 @@ type Classifier struct {
 	ollama llmClient
 	model  string
 
+	// maxRunes y llmOpts se fijan en New y NO se vuelven a escribir: se leen sin
+	// lock desde Classify. Reload solo intercambia cfg/prompt/schema.
+	maxRunes int
+	llmOpts  map[string]any
+
 	mu     sync.RWMutex
 	cfg    *intents.Config
 	prompt string
 	schema json.RawMessage
 }
 
+// Option ajusta un Classifier en su construcción (patrón funcional). Ver
+// WithMaxRunes y WithLLMOptions.
+type Option func(*Classifier)
+
+// WithMaxRunes fija el techo de entrada en runas. Con n <= 0 se usa
+// DefaultMaxRunes (nunca «sin techo»: quedarse sin techo es el bug que T2.5
+// vino a cerrar).
+func WithMaxRunes(n int) Option {
+	return func(c *Classifier) {
+		if n <= 0 {
+			n = DefaultMaxRunes
+		}
+		c.maxRunes = n
+	}
+}
+
+// WithLLMOptions FUSIONA opciones sobre las que el clasificador manda por
+// defecto (temperature, num_thread, num_ctx, num_predict); no las reemplaza. Una
+// clave repetida gana la del caller — es un override deliberado —, y las que no
+// menciona se conservan: en particular la temperatura 0.1 sobrevive siempre a una
+// fusión que no la nombre. Se copia el mapa recibido: mutarlo después no afecta al
+// clasificador.
+func WithLLMOptions(o map[string]any) Option {
+	return func(c *Classifier) {
+		for k, v := range o {
+			c.llmOpts[k] = v
+		}
+	}
+}
+
+// defaultLLMOptions son las opciones que viajan a Ollama en cada inferencia.
+// Devuelve un mapa nuevo en cada llamada (no se comparte estado entre
+// clasificadores).
+func defaultLLMOptions() map[string]any {
+	return map[string]any{
+		// Temperatura baja: clasificar quiere determinismo, no creatividad.
+		"temperature": 0.1,
+		"num_thread":  DefaultNumThread,
+		"num_ctx":     DefaultNumCtx,
+		"num_predict": DefaultNumPredict,
+	}
+}
+
 // New crea un clasificador para un modelo y un contrato de intenciones. El prompt
-// y el schema se derivan del contrato una sola vez aquí (y en cada Reload).
-func New(client llmClient, model string, cfg *intents.Config) *Classifier {
-	c := &Classifier{ollama: client, model: model}
+// y el schema se derivan del contrato una sola vez aquí (y en cada Reload). Sin
+// opciones se usan DefaultMaxRunes y las opciones de modelo por defecto.
+func New(client llmClient, model string, cfg *intents.Config, opts ...Option) *Classifier {
+	c := &Classifier{
+		ollama:   client,
+		model:    model,
+		maxRunes: DefaultMaxRunes,
+		llmOpts:  defaultLLMOptions(),
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(c)
+		}
+	}
 	c.apply(cfg)
 	return c
 }
@@ -72,14 +223,22 @@ func (c *Classifier) apply(cfg *intents.Config) {
 // Ollama tarda más de lo que el caller tolera, ctx lo corta y el caller degrada
 // (entrega el mensaje sin clasificar). Un JSON ilegible del modelo no es error:
 // se degrada a "desconocido" para no tumbar el flujo.
+//
+// El techo de entrada se aplica AQUÍ, no en el caller: así protege por igual al
+// worker cajero (que concatena un lote y llama una vez) y al camino inline viejo
+// del Edge, que sigue vivo hasta la Ola 3. Ningún llamador puede olvidarse de él.
 func (c *Classifier) Classify(ctx context.Context, text string) (Classification, error) {
 	c.mu.RLock()
 	cfg, prompt, schema := c.cfg, c.prompt, c.schema
 	c.mu.RUnlock()
 
+	// Techo de entrada: se recorta por RUNAS, nunca por bytes (cortar bytes parte
+	// un carácter multi-byte por la mitad y le manda al modelo un UTF-8 inválido).
+	prompted, truncado := truncateRunes(text, c.maxRunes)
+
 	messages := []ollama.Message{
 		{Role: "system", Content: prompt},
-		{Role: "user", Content: text},
+		{Role: "user", Content: prompted},
 	}
 
 	// think:false solo si el modelo tiene la capability; en modelos razonadores
@@ -96,22 +255,35 @@ func (c *Classifier) Classify(ctx context.Context, text string) (Classification,
 		Messages: messages,
 		Format:   schema,
 		Think:    think,
-		// Temperatura baja: clasificar quiere determinismo, no creatividad.
-		Options: map[string]any{"temperature": 0.1},
+		Options:  c.llmOpts,
 	})
 	if err != nil {
 		return Classification{}, fmt.Errorf("classifier: inferencia falló: %w", err)
 	}
+	metrics := metricsFrom(resp.Metrics())
 
 	out, ok := parseClassification(resp.Content())
 	if !ok {
 		// Aun con schema forzado conviene un fallback: derivar a "desconocido"
 		// deja que el Cloud caiga al flujo clásico en vez de romper el turno.
-		return Classification{Intent: intents.ReservedUnknown}, nil
+		// Aun degradado se devuelven métricas y Truncado: son justo los casos que
+		// el caller quiere ver en el log.
+		return Classification{Intent: intents.ReservedUnknown, Metrics: metrics, Truncado: truncado}, nil
 	}
+	out.Metrics, out.Truncado = metrics, truncado
 
 	// La gramática forzó la FORMA; aquí se valida la SEMÁNTICA.
-	out.Params = sanitizeParams(out.Params, paramsFor(cfg, out.Intent), text)
+	//
+	// DECISIÓN (T2.5): se sanea contra `prompted` (el texto TRUNCADO), no contra el
+	// original. sanitizeParams exige que el valor del param aparezca en el mensaje,
+	// y el invariante real que protege es «el valor estaba en lo que el modelo
+	// LEYÓ». Si un valor aparece solo en la cola que se cortó, el modelo no pudo
+	// extraerlo de ahí: lo copió de los ejemplos del prompt o lo alucinó, y coincidió
+	// por casualidad — exactamente la clase de fallo que sanitizeParams existe para
+	// matar. Sanear contra el texto completo relajaría el allowlist justo en las
+	// entradas más sospechosas (las gigantes). No se pierde ningún param legítimo:
+	// un param legítimo, por construcción, vive en lo que el modelo vio.
+	out.Params = sanitizeParams(out.Params, paramsFor(cfg, out.Intent), prompted)
 
 	// Por debajo del umbral, mejor "desconocido" que una acción equivocada: el
 	// sistema nunca queda peor que el flujo de números.
@@ -122,14 +294,50 @@ func (c *Classifier) Classify(ctx context.Context, text string) (Classification,
 	return out, nil
 }
 
+// truncateRunes recorta s a limit runas y reporta si hubo recorte. Con limit <= 0
+// devuelve s intacto (defensa: New nunca deja maxRunes en 0).
+//
+// El corte es por runas, así que jamás parte un carácter multi-byte: el resultado
+// siempre es UTF-8 válido y prefijo exacto de s.
+func truncateRunes(s string, limit int) (string, bool) {
+	if limit <= 0 {
+		return s, false
+	}
+	// len(s) en bytes es cota superior del número de runas: si no pasa el techo en
+	// bytes, tampoco en runas, y nos ahorramos la conversión a []rune (que en el
+	// caso patológico de 65 KB es la única asignación grande del camino).
+	if len(s) <= limit {
+		return s, false
+	}
+	r := []rune(s)
+	if len(r) <= limit {
+		return s, false
+	}
+	return string(r[:limit]), true
+}
+
+// classificationWire es la forma que se decodifica de la salida del modelo. Es
+// deliberadamente un tipo aparte de Classification: los campos que añade el Edge
+// (Metrics, Truncado) los pone el código, y ninguna salida del modelo debe poder
+// escribirlos.
+type classificationWire struct {
+	Intent     string            `json:"intent"`
+	Params     map[string]string `json:"params"`
+	Confidence float64           `json:"confidence"`
+}
+
 // parseClassification decodifica la salida del modelo. El bool es false si el
 // JSON es ilegible (el caller degrada a "desconocido" sin tratarlo como error).
 func parseClassification(content string) (Classification, bool) {
-	var out Classification
-	if err := json.Unmarshal([]byte(content), &out); err != nil {
+	var wire classificationWire
+	if err := json.Unmarshal([]byte(content), &wire); err != nil {
 		return Classification{}, false
 	}
-	return out, true
+	return Classification{
+		Intent:     wire.Intent,
+		Params:     wire.Params,
+		Confidence: wire.Confidence,
+	}, true
 }
 
 // paramsFor devuelve los params declarados por la intención name en el contrato,

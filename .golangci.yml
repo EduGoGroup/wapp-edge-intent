@@ -4,6 +4,11 @@ version: "2"
 run:
   timeout: 5m
   tests: true
+  # La batería contra Ollama real vive tras el build tag `ollama` (no corre en los
+  # gates), pero se lintea igual: sin esto el fichero quedaría fuera de toda
+  # verificación estática y se pudriría en silencio.
+  build-tags:
+    - ollama
 
 linters:
   enable:

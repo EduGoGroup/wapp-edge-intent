@@ -5,9 +5,9 @@ name: CI
 # desarrollo (`make ci-local` / `make ci-docker`, Go 1.26.5 + golangci-lint
 # v2.12.2 fijados), no en Actions. Este workflow queda para corridas
 # manuales (release futuro) — no se dispara con push ni pull_request.
-# La batería contra Ollama real se salta sola en CI (no hay modelo cargado),
-# así que `go test` corre solo lo unitario. Módulos wApp públicos: sin
-# GOPRIVATE ni token.
+# La batería contra Ollama real vive tras el build tag `ollama`, así que
+# `go test` (sin -tags) corre solo lo unitario y no la compila siquiera.
+# Módulos wApp públicos: sin GOPRIVATE ni token.
 on:
   workflow_dispatch:
 

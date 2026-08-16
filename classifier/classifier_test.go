@@ -3,10 +3,14 @@ package classifier
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"slices"
 	"strings"
 	"testing"
+	"time"
+	"unicode/utf8"
 
 	"github.com/EduGoGroup/wapp-edge-intent/ollama"
 	"github.com/EduGoGroup/wapp-shared/intents"
@@ -27,15 +31,29 @@ func loadFixture(t *testing.T) *intents.Config {
 }
 
 // stubLLM implementa llmClient: devuelve un contenido fijo y registra el request.
+// resp es una plantilla opcional para las métricas de la respuesta (durations y
+// contadores de tokens); su Message lo pisa siempre content.
 type stubLLM struct {
 	content  string
 	thinking bool
+	resp     ollama.ChatResponse
 	lastReq  ollama.ChatRequest
 }
 
 func (s *stubLLM) Chat(_ context.Context, req ollama.ChatRequest) (*ollama.ChatResponse, error) {
 	s.lastReq = req
-	return &ollama.ChatResponse{Message: ollama.Message{Content: s.content}}, nil
+	out := s.resp
+	out.Message = ollama.Message{Role: "assistant", Content: s.content}
+	return &out, nil
+}
+
+// userContent devuelve el texto que se le mandó al modelo como turno de usuario.
+func (s *stubLLM) userContent(t *testing.T) string {
+	t.Helper()
+	if len(s.lastReq.Messages) != 2 {
+		t.Fatalf("se esperaban 2 mensajes (system+user), hay %d", len(s.lastReq.Messages))
+	}
+	return s.lastReq.Messages[1].Content
 }
 
 func (s *stubLLM) SupportsThinking(_ context.Context, _ string) bool { return s.thinking }
@@ -246,6 +264,327 @@ func TestReloadSwapsConfig(t *testing.T) {
 	c.Reload(newCfg)
 	if !strings.Contains(c.prompt, "saludar") || strings.Contains(c.prompt, "crear_pedido") {
 		t.Error("Reload no regeneró el prompt con la config nueva")
+	}
+}
+
+// --- techo de entrada (T2.5) ---
+
+func TestTruncateRunesCutsByRunesNotBytes(t *testing.T) {
+	// "ñ" ocupa 2 bytes: recortar por bytes partiría el carácter por la mitad.
+	s := strings.Repeat("ñ", 10)
+	got, cut := truncateRunes(s, 4)
+	if !cut {
+		t.Error("se esperaba recorte")
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("el recorte produjo UTF-8 inválido: %q", got)
+	}
+	if n := utf8.RuneCountInString(got); n != 4 {
+		t.Errorf("runas = %d, se esperaban 4", n)
+	}
+	if len(got) != 8 {
+		t.Errorf("bytes = %d, se esperaban 8 (4 runas × 2 bytes) — ¿se cortó por bytes?", len(got))
+	}
+	if !strings.HasPrefix(s, got) {
+		t.Error("el recorte debe ser prefijo exacto del original")
+	}
+
+	// Justo en el límite y por debajo: no se toca nada.
+	if got, cut := truncateRunes(s, 10); cut || got != s {
+		t.Errorf("un texto de exactamente el techo no debe truncarse (cut=%v)", cut)
+	}
+	if got, cut := truncateRunes("hola", 4000); cut || got != "hola" {
+		t.Errorf("un texto corto no debe truncarse (cut=%v)", cut)
+	}
+	// Defensa: techo no positivo ⇒ no se recorta (New nunca lo deja así).
+	if got, cut := truncateRunes(s, 0); cut || got != s {
+		t.Error("con techo 0 no debe recortar")
+	}
+}
+
+func TestClassifyTruncatesInputAndMarksTruncado(t *testing.T) {
+	cfg := loadFixture(t)
+	content := `{"intent":"horario_atencion","confidence":0.9,"params":{}}`
+
+	// Multi-byte justo en el corte: 25 runas "ñ" = 50 bytes.
+	text := strings.Repeat("ñ", 50) + " a que hora abren"
+	stub := &stubLLM{content: content}
+	got, err := New(stub, "m", cfg, WithMaxRunes(25)).Classify(context.Background(), text)
+	if err != nil {
+		t.Fatalf("Classify: %v", err)
+	}
+	sent := stub.userContent(t)
+	if n := utf8.RuneCountInString(sent); n != 25 {
+		t.Errorf("se mandaron %d runas, se esperaban 25", n)
+	}
+	if len(sent) != 50 {
+		t.Errorf("bytes mandados = %d, se esperaban 50 — el corte no fue por runas", len(sent))
+	}
+	if !utf8.ValidString(sent) {
+		t.Errorf("se mandó UTF-8 inválido: %q", sent)
+	}
+	if !got.Truncado {
+		t.Error("Truncado debe ser true cuando se recorta")
+	}
+
+	// Sin recorte: el texto viaja íntegro y Truncado es false.
+	stub = &stubLLM{content: content}
+	got, err = New(stub, "m", cfg).Classify(context.Background(), "a que hora abren")
+	if err != nil {
+		t.Fatalf("Classify sin truncado: %v", err)
+	}
+	if sent := stub.userContent(t); sent != "a que hora abren" {
+		t.Errorf("el texto corto no debe alterarse, got %q", sent)
+	}
+	if got.Truncado {
+		t.Error("Truncado debe ser false cuando no se recorta")
+	}
+}
+
+// TestClassifyAppliesDefaultCeilingToHugeInput reproduce el criterio de T2.5: la
+// entrada de ~65 KB que hoy abre el breaker se recorta al techo por defecto.
+func TestClassifyAppliesDefaultCeilingToHugeInput(t *testing.T) {
+	cfg := loadFixture(t)
+	stub := &stubLLM{content: `{"intent":"desconocido","confidence":0}`}
+	huge := strings.Repeat("a", 65*1024)
+
+	got, err := New(stub, "m", cfg).Classify(context.Background(), huge)
+	if err != nil {
+		t.Fatalf("Classify: %v", err)
+	}
+	if n := utf8.RuneCountInString(stub.userContent(t)); n != DefaultMaxRunes {
+		t.Errorf("se mandaron %d runas, se esperaba el techo por defecto (%d)", n, DefaultMaxRunes)
+	}
+	if !got.Truncado {
+		t.Error("una entrada de 65 KB debe marcarse como truncada")
+	}
+}
+
+func TestWithMaxRunesNonPositiveFallsBackToDefault(t *testing.T) {
+	cfg := loadFixture(t)
+	for _, n := range []int{0, -1} {
+		stub := &stubLLM{content: `{"intent":"desconocido","confidence":0}`}
+		c := New(stub, "m", cfg, WithMaxRunes(n))
+		if c.maxRunes != DefaultMaxRunes {
+			t.Errorf("WithMaxRunes(%d): maxRunes = %d, se esperaba %d", n, c.maxRunes, DefaultMaxRunes)
+		}
+		if _, err := c.Classify(context.Background(), strings.Repeat("a", DefaultMaxRunes+10)); err != nil {
+			t.Fatalf("Classify: %v", err)
+		}
+		if got := utf8.RuneCountInString(stub.userContent(t)); got != DefaultMaxRunes {
+			t.Errorf("WithMaxRunes(%d): se mandaron %d runas, se esperaba %d", n, got, DefaultMaxRunes)
+		}
+	}
+}
+
+// TestClassifySanitizesAgainstTheTruncatedText fija la DECISIÓN de T2.5: el
+// allowlist semántico se aplica contra el texto TRUNCADO (lo que el modelo LEYÓ),
+// no contra el original. Un valor que solo vive en la cola cortada no pudo salir
+// de ahí: el modelo lo alucinó y coincidió por casualidad.
+func TestClassifySanitizesAgainstTheTruncatedText(t *testing.T) {
+	cfg := loadFixture(t)
+	const head = "quiero una " // 11 runas
+	text := head + "pizza margarita"
+	content := `{"intent":"crear_pedido","confidence":0.95,"params":{"producto":"margarita"}}`
+
+	// Con recorte: "margarita" queda fuera de lo que el modelo vio ⇒ se descarta.
+	got, err := New(&stubLLM{content: content}, "m", cfg, WithMaxRunes(len(head))).
+		Classify(context.Background(), text)
+	if err != nil {
+		t.Fatalf("Classify truncado: %v", err)
+	}
+	if !got.Truncado {
+		t.Fatal("el caso exige que haya recorte")
+	}
+	if got.Params != nil {
+		t.Errorf("un param que solo aparece en la cola cortada debe descartarse, got %v", got.Params)
+	}
+
+	// Sin recorte, el MISMO param sobrevive: el test mide el truncado, no el
+	// sanitizador.
+	got, err = New(&stubLLM{content: content}, "m", cfg).Classify(context.Background(), text)
+	if err != nil {
+		t.Fatalf("Classify completo: %v", err)
+	}
+	if got.Truncado {
+		t.Fatal("sin recorte Truncado debe ser false")
+	}
+	if got.Params["producto"] != "margarita" {
+		t.Errorf("sin recorte el param debía sobrevivir, got %v", got.Params)
+	}
+}
+
+// --- opciones del modelo (T2.5) ---
+
+func TestClassifySendsExplicitModelOptions(t *testing.T) {
+	cfg := loadFixture(t)
+	stub := &stubLLM{content: `{"intent":"desconocido","confidence":0}`}
+	if _, err := New(stub, "m", cfg).Classify(context.Background(), "hola que tal"); err != nil {
+		t.Fatalf("Classify: %v", err)
+	}
+	want := map[string]any{
+		"temperature": 0.1,
+		"num_thread":  DefaultNumThread,
+		"num_ctx":     DefaultNumCtx,
+		"num_predict": DefaultNumPredict,
+	}
+	for k, v := range want {
+		if got := stub.lastReq.Options[k]; got != v {
+			t.Errorf("options[%q] = %v, se esperaba %v", k, got, v)
+		}
+	}
+}
+
+func TestWithLLMOptionsMergesAndKeepsTemperature(t *testing.T) {
+	cfg := loadFixture(t)
+	stub := &stubLLM{content: `{"intent":"desconocido","confidence":0}`}
+	extra := map[string]any{"num_ctx": 8192, "seed": 7}
+
+	c := New(stub, "m", cfg, WithLLMOptions(extra))
+	// Mutar el mapa del caller después de construir NO debe afectar al clasificador.
+	extra["seed"] = 99
+	if _, err := c.Classify(context.Background(), "hola que tal"); err != nil {
+		t.Fatalf("Classify: %v", err)
+	}
+
+	opts := stub.lastReq.Options
+	if opts["temperature"] != 0.1 {
+		t.Errorf("la temperatura debe SOBREVIVIR a la fusión, got %v", opts["temperature"])
+	}
+	if opts["num_thread"] != DefaultNumThread || opts["num_predict"] != DefaultNumPredict {
+		t.Errorf("la fusión no debe borrar las opciones por defecto: %v", opts)
+	}
+	if opts["num_ctx"] != 8192 {
+		t.Errorf("num_ctx = %v, el override del caller debe ganar (8192)", opts["num_ctx"])
+	}
+	if opts["seed"] != 7 {
+		t.Errorf("seed = %v, se esperaba 7 (el mapa del caller debe copiarse)", opts["seed"])
+	}
+}
+
+// --- métricas (T2.6) ---
+
+func TestClassifyPopulatesMetricsEvenWhenDegraded(t *testing.T) {
+	cfg := loadFixture(t)
+	tmpl := ollama.ChatResponse{
+		TotalDuration:   int64(1500 * time.Millisecond),
+		LoadDuration:    int64(300 * time.Millisecond),
+		PromptEvalCount: 120,
+		EvalCount:       20,
+		EvalDuration:    int64(time.Second), // 20 tok / 1 s
+	}
+	want := Metrics{TotalMs: 1500, LoadMs: 300, PromptTokens: 120, OutputTokens: 20, TokensPerSec: 20}
+
+	cases := map[string]string{
+		"clasificación normal": `{"intent":"horario_atencion","confidence":0.9,"params":{}}`,
+		"JSON ilegible":        "no soy json",
+		"bajo umbral":          `{"intent":"crear_pedido","confidence":0.1,"params":{}}`,
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := New(&stubLLM{content: content, resp: tmpl}, "m", cfg).
+				Classify(context.Background(), "a que hora abren")
+			if err != nil {
+				t.Fatalf("Classify: %v", err)
+			}
+			if got.Metrics != want {
+				t.Errorf("Metrics = %+v, se esperaba %+v", got.Metrics, want)
+			}
+		})
+	}
+}
+
+// TestClassifyOptionsTravelInTheRequestJSON cierra el criterio de T2.5 de punta a
+// punta: contra un Ollama de mentira (httptest) y con el cliente HTTP real, las
+// tres opciones tienen que aparecer EN EL JSON de la petición (no basta con que
+// estén en la struct), y las métricas de la respuesta tienen que llegar arriba.
+func TestClassifyOptionsTravelInTheRequestJSON(t *testing.T) {
+	cfg := loadFixture(t)
+
+	var gotOpts map[string]any
+	var gotUser string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/show":
+			if err := json.NewEncoder(w).Encode(map[string]any{"capabilities": []string{"completion"}}); err != nil {
+				t.Errorf("encode /api/show: %v", err)
+			}
+		case "/api/chat":
+			var body struct {
+				Messages []ollama.Message `json:"messages"`
+				Options  map[string]any   `json:"options"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("body ilegible: %v", err)
+				return
+			}
+			gotOpts = body.Options
+			if len(body.Messages) == 2 {
+				gotUser = body.Messages[1].Content
+			}
+			if err := json.NewEncoder(w).Encode(ollama.ChatResponse{
+				Message:         ollama.Message{Role: "assistant", Content: `{"intent":"horario_atencion","confidence":0.9,"params":{}}`},
+				Done:            true,
+				TotalDuration:   int64(2 * time.Second),
+				LoadDuration:    int64(500 * time.Millisecond),
+				PromptEvalCount: 300,
+				EvalCount:       40,
+				EvalDuration:    int64(2 * time.Second), // 20 tok/s
+			}); err != nil {
+				t.Errorf("encode /api/chat: %v", err)
+			}
+		default:
+			t.Errorf("ruta inesperada: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	got, err := New(ollama.New(srv.URL), "qwen3:1.7b", cfg).
+		Classify(context.Background(), "a que hora abren")
+	if err != nil {
+		t.Fatalf("Classify: %v", err)
+	}
+	if got.Intent != "horario_atencion" {
+		t.Errorf("intent = %q", got.Intent)
+	}
+	if gotUser != "a que hora abren" {
+		t.Errorf("texto de usuario = %q", gotUser)
+	}
+	// Los números del JSON llegan como float64 al decodificar en map[string]any.
+	want := map[string]float64{
+		"temperature": 0.1,
+		"num_thread":  float64(DefaultNumThread),
+		"num_ctx":     float64(DefaultNumCtx),
+		"num_predict": float64(DefaultNumPredict),
+	}
+	for k, v := range want {
+		val, ok := gotOpts[k].(float64)
+		if !ok {
+			t.Errorf("options[%q] no viajó en el JSON de la petición (got %v)", k, gotOpts[k])
+			continue
+		}
+		if val != v {
+			t.Errorf("options[%q] = %v, se esperaba %v", k, val, v)
+		}
+	}
+	wantMetrics := Metrics{TotalMs: 2000, LoadMs: 500, PromptTokens: 300, OutputTokens: 40, TokensPerSec: 20}
+	if got.Metrics != wantMetrics {
+		t.Errorf("Metrics = %+v, se esperaba %+v", got.Metrics, wantMetrics)
+	}
+	if got.Truncado {
+		t.Error("Truncado debe ser false para un mensaje corto")
+	}
+}
+
+// TestParseClassificationIgnoresInjectedFields: los campos que añade el Edge no
+// son escribibles desde la salida del modelo.
+func TestParseClassificationIgnoresInjectedFields(t *testing.T) {
+	out, ok := parseClassification(`{"intent":"ver_carrito","confidence":0.9,"truncado":true,"metrics":{"total_ms":999}}`)
+	if !ok {
+		t.Fatal("el JSON era válido")
+	}
+	if out.Truncado || out.Metrics != (Metrics{}) {
+		t.Errorf("el modelo no debe poder escribir Truncado/Metrics: %+v", out)
 	}
 }
 
