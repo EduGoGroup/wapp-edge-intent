@@ -1,3 +1,5 @@
+//go:build ollama
+
 package classifier
 
 import (
@@ -13,9 +15,13 @@ import (
 // Reproduce los 12 casos medidos en el prototipo miniWapp: 2 resueltos por el
 // carril rápido (0 ms, sin LLM) y 10 clasificados por el modelo.
 //
-// Se salta sola si Ollama no responde en 2 s (CI sin modelo). Overrides por env:
-// WAPP_INTENT_TEST_URL (default http://127.0.0.1:11434) y WAPP_INTENT_TEST_MODEL
-// (default qwen3:1.7b).
+// SOLO se compila con `-tags ollama` (`make battery`). Antes no tenía build tag y
+// se saltaba sola cuando Ollama no respondía: corría en cada CI y se saltaba en
+// cada CI, en silencio, dando la falsa sensación de estar cubriendo algo. Ahora
+// pedir el tag es pedir la batería: si no hay Ollama, es un FALLO, no un salto.
+//
+// Overrides por env: WAPP_INTENT_TEST_URL (default http://127.0.0.1:11434) y
+// WAPP_INTENT_TEST_MODEL (default qwen3:1.7b).
 func TestBattery(t *testing.T) {
 	url := envOr("WAPP_INTENT_TEST_URL", "http://127.0.0.1:11434")
 	model := envOr("WAPP_INTENT_TEST_MODEL", "qwen3:1.7b")
@@ -24,7 +30,7 @@ func TestBattery(t *testing.T) {
 	healthCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := client.Health(healthCtx); err != nil {
-		t.Skipf("Ollama no disponible en %s (%v); se salta la batería", url, err)
+		t.Fatalf("Ollama no disponible en %s (%v): con -tags ollama la batería es obligatoria", url, err)
 	}
 
 	cfg := loadFixture(t)

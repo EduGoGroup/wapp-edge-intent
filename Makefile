@@ -8,7 +8,7 @@ LINT_VERSION := v2.12.2
 build:
 	go build ./...
 
-# Tests unitarios (la batería contra Ollama real se salta sola si no hay modelo).
+# Tests unitarios (sin Ollama: la batería vive tras el build tag `ollama`).
 test:
 	go test ./... -count=1
 
@@ -33,8 +33,10 @@ lint:
 check: fmt vet test-race lint
 
 # Corre solo la batería de validación contra Ollama (requiere el modelo cargado).
+# El build tag `ollama` es obligatorio: sin él la batería ni se compila, y con él
+# la ausencia de Ollama es un fallo (antes se saltaba sola y nadie se enteraba).
 battery:
-	go test ./classifier -run TestBattery -count=1 -v
+	go test -tags ollama ./classifier -run TestBattery -count=1 -v
 
 # --- Red local de CI (réplica de .github/workflows/ci.yml) ---
 

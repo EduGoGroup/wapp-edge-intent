@@ -21,14 +21,55 @@ clasificar** (degradación, nunca caída): el LLM solo suma.
 ollama/       cliente HTTP de Ollama (Chat con structured outputs, métricas,
               caché de capabilities, ListModels, Health). Sin timeout global:
               lo pone el contexto del caller.
-classifier/   Classifier: New(client, model, cfg) + Reload(cfg) + Classify(ctx, text).
-              prompt/schema regenerados desde el contrato de intents; sanitizeParams
-              como allowlist real; FastLane para descartar lo trivial sin LLM.
+classifier/   Classifier: New(client, model, cfg, opts...) + Reload(cfg) +
+              Classify(ctx, text). prompt/schema regenerados desde el contrato de
+              intents; sanitizeParams como allowlist real; FastLane para descartar
+              lo trivial sin LLM.
 ```
 
 El contrato de intenciones lo define el módulo compartido
-`github.com/EduGoGroup/wapp-shared/intents` (tipos + validación). Aquí se consume
-por réplica local (`replace` en `go.mod`) hasta cortar `intents/v0.1.0`.
+`github.com/EduGoGroup/wapp-shared/intents` (tipos + validación), que se consume
+como dependencia normal (`go.mod`, `intents v0.1.0`) — sin `replace`.
+
+## API pública
+
+```go
+// Construcción. Sin opciones se usan los valores por defecto de abajo.
+func New(client llmClient, model string, cfg *intents.Config, opts ...Option) *Classifier
+func WithMaxRunes(n int) Option              // techo de entrada; n <= 0 ⇒ DefaultMaxRunes
+func WithLLMOptions(o map[string]any) Option // se FUSIONA sobre las opciones por defecto
+
+func (c *Classifier) Classify(ctx context.Context, text string) (Classification, error)
+func (c *Classifier) Reload(cfg *intents.Config)
+func FastLane(text string) bool
+
+type Classification struct {
+    Intent     string
+    Params     map[string]string
+    Confidence float64
+    Metrics    Metrics // costo de la inferencia (total_ms, tokens); también en las degradadas
+    Truncado   bool    // el texto superaba el techo y se recortó
+}
+
+type Metrics struct {
+    TotalMs, LoadMs            int64
+    PromptTokens, OutputTokens int
+    TokensPerSec               float64
+}
+```
+
+Constantes exportadas para que el caller no duplique los números a ciegas:
+
+| Constante | Valor | Por qué |
+|---|---|---|
+| `DefaultMaxRunes` | `1000` | Techo de entrada en **runas** (no bytes). Cabe **siempre** en `DefaultNumCtx`, incluso en el alfabeto más denso medido (emoji, 1,0 tok/runa): 1000 + ~1500 de prompt de sistema + 256 de salida = 2.756 < 4.096. Y acota la latencia (~13 s en español). Es 5× el lote real más grande observado (196 runas). |
+| `DefaultNumThread` | `5` | Medición de la O0 del Plan 051 sobre el VPS AMD real. No se re-discute sin medir. |
+| `DefaultNumCtx` | `4096` | Cabe el prompt de sistema (911 tok medidos, hasta ~1500 con un contrato rico) + el techo de entrada + `num_predict`. Explícito para no depender del default del build de Ollama; y hace de **segundo techo** de costo. **No se sube**: pasar a 8192 cuesta +493 MB de RSS medidos y no toca el problema que aparece antes, que es el **tiempo**. |
+| `DefaultNumPredict` | `256` | La salida es un JSON corto (30–60 tok medidos); 256 da margen y **acota una generación desbocada**. |
+
+`WithLLMOptions` fusiona: una clave que el caller no menciona se conserva (la
+**temperatura 0.1 sobrevive siempre**); una que sí menciona gana como override
+deliberado.
 
 ## Invariantes (no relajar sin medir)
 
@@ -47,6 +88,30 @@ Cada uno nace de un fallo observado en el prototipo miniWapp:
 - **Few-shot desde el contrato**: los ejemplos valen más que las instrucciones.
 - **FastLane antes del LLM**: números cortos, sí/no/ok, vacío ⇒ no clasificar (0 ms).
 - **Umbral de confianza**: por debajo ⇒ `desconocido`. Nunca peor que el flujo clásico.
+- **`confidence` acotada a `[0,1]` en el schema** (`minimum`/`maximum`). Sin ese rango
+  el umbral es **decorativo**: `{"confidence":100}` es JSON válido y `100 < 0.6` es
+  falso, así que pasa. Medido: qwen3:1.7b devolvió un intent equivocado con
+  `confidence: 100` y el umbral no lo atrapó. La defensa es la **gramática**;
+  `parseClassification` no satura ni rechaza fuera de rango.
+- **Techo de entrada dentro de `Classify`**, no en el caller: así protege por igual
+  al worker cajero (que concatena un lote) y al camino inline; ningún llamador puede
+  olvidárselo. Se recorta por **runas**, jamás por bytes. Sin techo, pegar ~65 KB en
+  un chat basta para abrir el circuit breaker del Edge y apagar el clasificador de
+  **todas** las sesiones: es la denegación de servicio más barata que existía.
+- **El techo se calibra para que la ventana NUNCA se desborde**, en ningún alfabeto.
+  Desbordar no es una degradación segura: Ollama descarta la entrada que no cabe
+  (medido, el 58 %) y el modelo devuelve un intent plausible y **equivocado** con
+  confianza máxima. Es un fallo silencioso y activo.
+- **`sanitizeParams` se aplica contra el texto TRUNCADO**, no contra el original.
+  El invariante real es «el valor estaba en lo que el modelo **leyó**». Un valor que
+  solo aparece en la cola cortada no pudo extraerse de ahí: el modelo lo alucinó y
+  coincidió por casualidad — justo el fallo que el allowlist existe para matar.
+- **Opciones del modelo explícitas** (`num_thread`, `num_ctx`, `num_predict`): no se
+  depende del default del build de Ollama ni del Modelfile, que cambian entre
+  versiones.
+- **Las métricas de Ollama se propagan** en `Classification.Metrics` (también en las
+  salidas degradadas): son justo los casos que hay que medir. El log del caller lleva
+  `total_ms` y tokens, **nunca el texto clasificado** (INV-051.1).
 
 ## Batería de validación
 
@@ -60,13 +125,20 @@ make battery
 # Overrides: WAPP_INTENT_TEST_URL, WAPP_INTENT_TEST_MODEL.
 ```
 
-Sin Ollama (p. ej. en CI), la batería se **salta sola** (`/api/tags` no responde en 2 s).
+La batería vive tras el **build tag `ollama`**: sin `-tags ollama` ni siquiera se
+compila, y **con** el tag la ausencia de Ollama es un **fallo**, no un salto. Antes
+no tenía tag y se saltaba sola: corría en cada CI y se saltaba en cada CI, en
+silencio, aparentando cobertura que no existía. Los gates (`make check`,
+`make ci-local`) corren **solo lo unitario**; la batería es una corrida deliberada
+en una máquina con modelo. El lint sí la analiza (`build-tags: [ollama]` en
+`.golangci.yml`) para que no se pudra.
 
 ## Comandos
 
 ```bash
 make build       # compila
-make test        # tests unitarios (+ batería si hay modelo)
+make test        # tests unitarios (sin Ollama)
 make test-race   # tests con detector de carreras
 make check       # fmt + vet + test-race + lint (puerta local)
+make battery     # batería contra Ollama real (-tags ollama; requiere el modelo)
 ```
