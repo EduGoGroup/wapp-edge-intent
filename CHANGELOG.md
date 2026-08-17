@@ -4,7 +4,11 @@ Todos los cambios notables de `wapp-edge-intent`. El formato sigue
 [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/) y el versionado es
 [SemVer](https://semver.org/lang/es/).
 
-## [Unreleased] — propuesta: **v0.2.0**
+## [Unreleased]
+
+Nada todavía.
+
+## [0.2.0] — 2026-08-16
 
 Versión **menor**, no parche: hay **API pública nueva**. La API es **compatible
 hacia atrás** — `New` pasa a variádico (`opts ...Option`), que compila igual para
