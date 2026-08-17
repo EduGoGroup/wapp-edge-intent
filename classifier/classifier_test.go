@@ -95,6 +95,42 @@ func TestBuildSchemaParamsAreFreeNotProperties(t *testing.T) {
 	}
 }
 
+// TestBuildSchemaBoundsConfidence fija el RANGO de `confidence` en la gramática.
+//
+// Sin minimum/maximum, `{"confidence":100}` es JSON perfectamente válido para este
+// schema y el umbral de Classify (`out.Confidence < cfg.UmbralConfianza`) no puede
+// atrapar nada: 100 < 0.6 es falso. No es teoría — medido contra qwen3:1.7b, que
+// devolvió "horario_atencion" con confidence: 100 y pasó un umbral de 0.6.
+//
+// El test mira la GRAMÁTICA, no el parseo, porque hoy la gramática es la única
+// defensa: parseClassification no satura ni rechaza un valor fuera de rango.
+func TestBuildSchemaBoundsConfidence(t *testing.T) {
+	cfg := loadFixture(t)
+	var s struct {
+		Properties struct {
+			Confidence map[string]json.RawMessage `json:"confidence"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(buildSchema(cfg), &s); err != nil {
+		t.Fatalf("schema ilegible: %v", err)
+	}
+	for _, k := range []string{"minimum", "maximum"} {
+		if _, ok := s.Properties.Confidence[k]; !ok {
+			t.Fatalf("confidence no declara %q: el umbral de Classify queda decorativo (100 < 0.6 es falso)", k)
+		}
+	}
+	var lo, hi float64
+	if err := json.Unmarshal(s.Properties.Confidence["minimum"], &lo); err != nil {
+		t.Fatalf("minimum ilegible: %v", err)
+	}
+	if err := json.Unmarshal(s.Properties.Confidence["maximum"], &hi); err != nil {
+		t.Fatalf("maximum ilegible: %v", err)
+	}
+	if lo != 0 || hi != 1 {
+		t.Errorf("confidence acotada a [%v,%v], se esperaba [0,1] — el umbral compara probabilidades, no porcentajes", lo, hi)
+	}
+}
+
 // --- prompt ---
 
 func TestBuildPromptContainsIntentsAndExamples(t *testing.T) {
@@ -293,7 +329,7 @@ func TestTruncateRunesCutsByRunesNotBytes(t *testing.T) {
 	if got, cut := truncateRunes(s, 10); cut || got != s {
 		t.Errorf("un texto de exactamente el techo no debe truncarse (cut=%v)", cut)
 	}
-	if got, cut := truncateRunes("hola", 4000); cut || got != "hola" {
+	if got, cut := truncateRunes("hola", DefaultMaxRunes); cut || got != "hola" {
 		t.Errorf("un texto corto no debe truncarse (cut=%v)", cut)
 	}
 	// Defensa: techo no positivo ⇒ no se recorta (New nunca lo deja así).
@@ -357,6 +393,41 @@ func TestClassifyAppliesDefaultCeilingToHugeInput(t *testing.T) {
 	}
 	if !got.Truncado {
 		t.Error("una entrada de 65 KB debe marcarse como truncada")
+	}
+}
+
+// TestDefaultCeilingFitsTheContextWindow fija la ARITMÉTICA que justifica el techo
+// de entrada (no el número por el número): el peor caso de prompt tiene que caber
+// en DefaultNumCtx, y el techo tiene que seguir cubriendo el tráfico real.
+//
+// El peor caso lo marca el alfabeto más denso medido con qwen3:1.7b —el EMOJI, a
+// 1,0 tokens/runa (español 0,257 · cirílico 0,390 · CJK 0,666)— más el prompt de
+// sistema (911 tokens hoy; DefaultNumCtx anticipa hasta ~1500 con un contrato rico)
+// más la respuesta (DefaultNumPredict). Con el techo viejo de 4000 esto NO cabía:
+// el emoji medía 4.912 tokens de prompt_eval contra una ventana de 4.096, y Ollama
+// descartaba el 58 % de la entrada en silencio.
+//
+// El otro motivo del techo, la LATENCIA (a 4000 runas la inferencia tardaba 32,6 s
+// en español y 119,7 s en emoji, contra un plazo de 15 s en el worker), no se puede
+// comprobar aquí: el plazo lo fija el consumidor y este paquete no lo conoce.
+func TestDefaultCeilingFitsTheContextWindow(t *testing.T) {
+	const (
+		peorCasoTokPorRuna  = 1    // emoji: 1,0 tok/runa, el máximo medido
+		systemPromptRicoTok = 1500 // el contrato rico que DefaultNumCtx anticipa
+		loteRealMaxRunas    = 196  // lote más grande observado en tráfico real (8 mensajes)
+	)
+
+	peorCaso := DefaultMaxRunes*peorCasoTokPorRuna + systemPromptRicoTok + DefaultNumPredict
+	if peorCaso > DefaultNumCtx {
+		t.Errorf("peor caso %d tokens (%d runas × %d tok/runa + %d de prompt de sistema + %d de salida) no cabe en num_ctx %d: la entrada se descarta en silencio",
+			peorCaso, DefaultMaxRunes, peorCasoTokPorRuna, systemPromptRicoTok, DefaultNumPredict, DefaultNumCtx)
+	}
+
+	// Suelo: el techo tampoco puede bajar tanto que recorte tráfico legítimo. Hoy es
+	// 5× el lote real más grande medido; se exige 3× para dejar margen de calibración.
+	if DefaultMaxRunes < 3*loteRealMaxRunas {
+		t.Errorf("techo %d runas: por debajo de 3× el lote real más grande medido (%d runas), recortaría tráfico legítimo",
+			DefaultMaxRunes, loteRealMaxRunas)
 	}
 }
 

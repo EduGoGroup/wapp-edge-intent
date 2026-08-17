@@ -6,18 +6,22 @@ Todos los cambios notables de `wapp-edge-intent`. El formato sigue
 
 ## [Unreleased] — propuesta: **v0.2.0**
 
-Versión **menor**, no parche: hay **API pública nueva**. Todo lo de abajo es
-**aditivo** y **no rompe a ningún consumidor de `v0.1.0`** — `New` pasa a
-variádico (`opts ...Option`), que es compatible hacia atrás para todos los
-llamadores existentes, y `Classification` solo gana campos. Un consumidor que
-compile contra `v0.1.0` compila igual contra esto sin tocar una línea.
+Versión **menor**, no parche: hay **API pública nueva**. La API es **compatible
+hacia atrás** — `New` pasa a variádico (`opts ...Option`), que compila igual para
+todos los llamadores existentes, y `Classification` solo gana campos. Un consumidor
+de `v0.1.0` compila contra esto sin tocar una línea.
+
+⚠️ Pero **no todo es aditivo**: `DefaultMaxRunes` baja de **4000 a 1000** runas.
+Compila igual y **cambia el comportamiento en tiempo de ejecución** — una entrada de
+entre 1.000 y 4.000 runas que antes viajaba entera al modelo ahora se recorta y llega
+con `Truncado: true`. Está en `Changed`, con la medición que lo obliga.
 
 Plan 051 (worker cajero del Edge), Ola 2 · tareas **T2.5** y **T2.6**.
 
 ### Added
 
 - **Techo de entrada por runas** (`T2.5`). `Classify` recorta el texto a
-  `DefaultMaxRunes` (**4000**) antes de mandarlo al modelo. El corte es por
+  `DefaultMaxRunes` (**1000**; ver el `Changed` de abajo) antes de mandarlo al modelo. El corte es por
   **runas**, nunca por bytes: jamás parte un carácter multi-byte. Configurable con
   `WithMaxRunes(n)`; con `n <= 0` cae al default (nunca «sin techo»).
   - **Por qué**: sin techo, pegar ~65 KB de texto en un chat basta para que la
@@ -51,6 +55,34 @@ Plan 051 (worker cajero del Edge), Ola 2 · tareas **T2.5** y **T2.6**.
 
 ### Changed
 
+- ⚠️ **CAMBIO DE COMPORTAMIENTO — `DefaultMaxRunes` baja de `4000` a `1000` runas.**
+  El 4000 se calculó a ojo contando tokens de español y **no sobrevivió a la medición
+  contra Ollama real**. Falla por dos motivos independientes:
+  - **Encaje.** El prompt de sistema mide **911 tokens** y la densidad depende del
+    alfabeto (tok/runa medidos con `qwen3:1.7b`): español **0,257**, cirílico
+    **0,390**, CJK **0,666**, emoji **1,000**. Con techo 4000 el `prompt_eval_count`
+    real es 1.914 (es), 2.472 (ru), 3.577 (CJK) y **4.912 (emoji)**. El emoji **no
+    cabe** en `DefaultNumCtx` (4096): medido, Ollama evaluó solo 2.050 tokens y
+    **descartó el 58 % de la entrada**.
+  - **Tiempo**, que ninguna ventana arregla y es el peor de los dos. A 4000 runas la
+    inferencia tarda **32,6 s en español**, 34–71 s en CJK y **119,7 s en emoji**. El
+    plazo del worker cajero (15 s) ya se cruza a **~1.500 runas de español** y **~500
+    de CJK**, mucho antes de que el contexto se quede corto.
+  - **Por qué 1000**: en el peor caso concebible (1,0 tok/runa) son 1.000 tokens; más
+    el prompt de sistema de un «contrato rico» (~1.500) y la respuesta (256) suman
+    **2.756 < 4.096**. Cabe siempre, en cualquier alfabeto y aunque el contrato
+    engorde; acota la latencia del peor caso a ~13 s (es) y ~26 s (CJK); y sigue
+    siendo **5× el lote real más grande observado** (8 mensajes concatenados, 98–196
+    runas), así que no toca tráfico legítimo. Fijado por
+    `TestDefaultCeilingFitsTheContextWindow`, que comprueba la **aritmética**, no el
+    número.
+  - **`DefaultNumCtx` y `DefaultNumPredict` NO se tocan.** Subir `num_ctx` a 8192
+    arregla el encaje, cuesta **+493 MB de RSS medidos** y no toca el problema del
+    tiempo. La respuesta correcta a una entrada gigante es bajar el techo de entrada,
+    no ensanchar la ventana.
+  - **Impacto para el consumidor**: el worker cajero del Edge toma este default vía
+    `WAPP_WORKER_MAX_RUNES` / `worker.max_runes`; quien haya fijado un valor propio en
+    su config lo conserva.
 - **`sanitizeParams` se aplica ahora contra el texto TRUNCADO**, no contra el
   original. El invariante que protege el allowlist es «el valor estaba en lo que el
   modelo **leyó**»: un valor que solo aparece en la cola cortada no pudo salir de
@@ -69,6 +101,30 @@ Plan 051 (worker cajero del Edge), Ola 2 · tareas **T2.5** y **T2.6**.
   existía. Ahora pedir el tag es pedir la batería, y no tener Ollama es un fallo.
   `make battery` pasa `-tags ollama`; `.golangci.yml` declara el tag para que el
   fichero siga lintándose y no se pudra.
+
+### Fixed
+
+- **El umbral de confianza no podía atrapar nada.** El schema declaraba
+  `"confidence": {"type":"number"}` **sin `minimum` ni `maximum`**, así que
+  `{"confidence": 100}` era JSON perfectamente válido para la gramática y el filtro de
+  `Classify` (`if out.Confidence < cfg.UmbralConfianza`) resultaba **decorativo**:
+  `100 < 0.6` es falso y la respuesta pasaba entera.
+  - **Medido**, no teórico: ante una entrada que desbordaba la ventana de contexto,
+    `qwen3:1.7b` devolvió `horario_atencion` con `confidence: 100` y el umbral (0.6)
+    la dejó pasar — un intent **seguro y equivocado**.
+  - Afecta a **cualquier** salida en la que el modelo confunda la escala (0–1 vs
+    porcentaje), no solo al desbordamiento.
+  - **Arreglo**: `confidence` se acota a `[0,1]` en el schema, de modo que la gramática
+    impide emitir el número fuera de escala y el umbral vuelve a comparar lo que cree
+    comparar. Lo que **no** promete: el modelo sigue pudiendo emitir un `1.0` seguro y
+    equivocado. La defensa es la gramática — `parseClassification` no satura ni rechaza
+    un valor fuera de rango. Fijado por `TestBuildSchemaBoundsConfidence`.
+- **Corregidos dos comentarios que decían algo falso** sobre `DefaultNumCtx`: (1)
+  nombraban el **CJK** como el alfabeto que podía desbordar la ventana, cuando el CJK
+  es justo el que cabe (3.577 de 4.096) y quien desborda es el **emoji**; y (2)
+  prometían que un desbordamiento «degrada a `desconocido` en silencio», cuando lo
+  medido es que **no degrada**: devuelve un intent plausible y equivocado con confianza
+  máxima. Desbordar es un fallo silencioso y **activo**, no una degradación segura.
 
 ### Docs
 

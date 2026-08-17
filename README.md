@@ -62,9 +62,9 @@ Constantes exportadas para que el caller no duplique los números a ciegas:
 
 | Constante | Valor | Por qué |
 |---|---|---|
-| `DefaultMaxRunes` | `4000` | Techo de entrada en **runas** (no bytes). Un pedido real cabe de sobra; 4000 runas de español son ~1000–1300 tokens. |
+| `DefaultMaxRunes` | `1000` | Techo de entrada en **runas** (no bytes). Cabe **siempre** en `DefaultNumCtx`, incluso en el alfabeto más denso medido (emoji, 1,0 tok/runa): 1000 + ~1500 de prompt de sistema + 256 de salida = 2.756 < 4.096. Y acota la latencia (~13 s en español). Es 5× el lote real más grande observado (196 runas). |
 | `DefaultNumThread` | `5` | Medición de la O0 del Plan 051 sobre el VPS AMD real. No se re-discute sin medir. |
-| `DefaultNumCtx` | `4096` | Cabe el prompt de sistema (~600–1500 tok) + el techo de entrada + `num_predict`. Explícito para no depender del default del build de Ollama; y hace de **segundo techo** de costo. Subirlo cuesta RAM permanente (la KV cache crece lineal). |
+| `DefaultNumCtx` | `4096` | Cabe el prompt de sistema (911 tok medidos, hasta ~1500 con un contrato rico) + el techo de entrada + `num_predict`. Explícito para no depender del default del build de Ollama; y hace de **segundo techo** de costo. **No se sube**: pasar a 8192 cuesta +493 MB de RSS medidos y no toca el problema que aparece antes, que es el **tiempo**. |
 | `DefaultNumPredict` | `256` | La salida es un JSON corto (30–60 tok medidos); 256 da margen y **acota una generación desbocada**. |
 
 `WithLLMOptions` fusiona: una clave que el caller no menciona se conserva (la
@@ -88,11 +88,20 @@ Cada uno nace de un fallo observado en el prototipo miniWapp:
 - **Few-shot desde el contrato**: los ejemplos valen más que las instrucciones.
 - **FastLane antes del LLM**: números cortos, sí/no/ok, vacío ⇒ no clasificar (0 ms).
 - **Umbral de confianza**: por debajo ⇒ `desconocido`. Nunca peor que el flujo clásico.
+- **`confidence` acotada a `[0,1]` en el schema** (`minimum`/`maximum`). Sin ese rango
+  el umbral es **decorativo**: `{"confidence":100}` es JSON válido y `100 < 0.6` es
+  falso, así que pasa. Medido: qwen3:1.7b devolvió un intent equivocado con
+  `confidence: 100` y el umbral no lo atrapó. La defensa es la **gramática**;
+  `parseClassification` no satura ni rechaza fuera de rango.
 - **Techo de entrada dentro de `Classify`**, no en el caller: así protege por igual
   al worker cajero (que concatena un lote) y al camino inline; ningún llamador puede
   olvidárselo. Se recorta por **runas**, jamás por bytes. Sin techo, pegar ~65 KB en
   un chat basta para abrir el circuit breaker del Edge y apagar el clasificador de
   **todas** las sesiones: es la denegación de servicio más barata que existía.
+- **El techo se calibra para que la ventana NUNCA se desborde**, en ningún alfabeto.
+  Desbordar no es una degradación segura: Ollama descarta la entrada que no cabe
+  (medido, el 58 %) y el modelo devuelve un intent plausible y **equivocado** con
+  confianza máxima. Es un fallo silencioso y activo.
 - **`sanitizeParams` se aplica contra el texto TRUNCADO**, no contra el original.
   El invariante real es «el valor estaba en lo que el modelo **leyó**». Un valor que
   solo aparece en la cola cortada no pudo extraerse de ahí: el modelo lo alucinó y

@@ -30,11 +30,34 @@ const (
 	// Edge, apagando el clasificador de TODAS las sesiones. Es la vía más barata
 	// de denegar el servicio desde fuera, y no cuesta nada cerrarla.
 	//
-	// POR QUÉ 4000: un pedido real de WhatsApp cabe de sobra (los mensajes de
-	// negocio viven en cientos de caracteres, y el lote que concatena el cajero
-	// rara vez pasa del millar); 4000 runas de español son ~1000–1300 tokens, que
-	// entran holgados en DefaultNumCtx junto al prompt de sistema.
-	DefaultMaxRunes = 4000
+	// POR QUÉ 1000 (y no 4000, que es lo que había): el 4000 se puso a ojo contando
+	// tokens de español y NO sobrevivió a la medición contra Ollama real. Falla por
+	// DOS motivos independientes, y el segundo es el peor.
+	//
+	// 1) ENCAJE. El prompt de sistema mide 911 tokens, y la densidad depende del
+	// alfabeto (tokens/runa medidos con qwen3:1.7b): español 0,257 · cirílico 0,390 ·
+	// CJK 0,666 · emoji 1,000. Con techo 4000, el prompt_eval_count REAL es 1.914
+	// (es), 2.472 (ru), 3.577 (CJK) y 4.912 (emoji). Los tres primeros caben en
+	// DefaultNumCtx; el emoji NO: medido a num_ctx=4096, Ollama evaluó solo 2.050
+	// tokens y DESCARTÓ el 58 % de la entrada.
+	//
+	// 2) TIEMPO, que ninguna ventana de contexto arregla. A 4000 runas la inferencia
+	// tarda 32,6 s en español, 34–71 s en CJK y 119,7 s en emoji. El plazo del worker
+	// cajero (15 s) ya se cruza a ~1.500 runas de español y ~500 de CJK: mucho antes
+	// de que el contexto se quede corto. Por eso NO se sube num_ctx (ver DefaultNumCtx).
+	//
+	// La aritmética del 1000: en el peor caso concebible (1,0 tok/runa, emoji puro)
+	// son 1.000 tokens; más un prompt de sistema del «contrato rico» que DefaultNumCtx
+	// anticipa (~1.500 tok) y la respuesta (DefaultNumPredict, 256) suman 2.756 < 4.096.
+	// Cabe SIEMPRE, en cualquier alfabeto y aunque el contrato engorde. Y acota la
+	// latencia del peor caso a ~13 s en español y ~26 s en CJK: el español entra en el
+	// plazo del worker, y el CJK patológico lo cruza pero lo corta el timeout, que es
+	// una degradación SEGURA (el caller entrega el mensaje sin clasificar) — al revés
+	// que el desbordamiento de contexto, que devuelve una respuesta segura y falsa.
+	//
+	// No toca tráfico legítimo: el lote más grande observado en tráfico real (8
+	// mensajes concatenados) va de 98 a 196 runas. 1000 es 5× ese máximo.
+	DefaultMaxRunes = 1000
 
 	// DefaultNumThread es el número de hilos de inferencia.
 	//
@@ -46,20 +69,31 @@ const (
 	// DefaultNumCtx es la ventana de contexto pedida a Ollama, en tokens.
 	//
 	// POR QUÉ 4096: tiene que caber el prompt de sistema (que se regenera desde el
-	// contrato: intenciones + vocabulario + few-shots; ~600–1500 tokens para un
-	// contrato rico) MÁS el techo de entrada (~1000–1300 tokens para 4000 runas de
-	// español) MÁS la respuesta (DefaultNumPredict). El peor caso realista queda
-	// cerca de 3000, dentro de 4096.
+	// contrato: intenciones + vocabulario + few-shots; 911 tokens medidos hoy, hasta
+	// ~1500 para un contrato rico) MÁS el techo de entrada (1000 tokens en el peor
+	// caso, ver DefaultMaxRunes) MÁS la respuesta (DefaultNumPredict). El peor caso
+	// suma 2.756, dentro de 4096.
 	//
 	// Se manda EXPLÍCITO para no depender del default del build de Ollama ni del
 	// Modelfile del modelo, que cambian entre versiones. Y hace de segundo techo:
 	// aunque el techo de runas fallara, el costo de una inferencia queda acotado.
 	//
-	// Subirlo cuesta RAM permanente en la caja del cliente (la KV cache crece
-	// lineal con num_ctx: ~0,5 GB en qwen3:1.7b a 4096, el doble a 8192), por eso
-	// no se sube «por si acaso». Una entrada patológica de 4000 runas CJK sí podría
-	// desbordar: Ollama recorta por la izquierda, el modelo devuelve algo ilegible y
-	// la clasificación degrada a "desconocido" — degradación segura, no caída.
+	// POR QUÉ NO SE SUBE: cuesta RAM permanente en la caja del cliente (la KV cache
+	// crece lineal con num_ctx; medido, pasar a 8192 son +493 MB de RSS) y NO compra
+	// nada, porque el problema que aparece antes es el TIEMPO, no el contexto: a
+	// techo alto la inferencia se pasa del plazo del worker mucho antes de quedarse
+	// sin ventana. La respuesta correcta a una entrada gigante es bajar el techo de
+	// entrada, no ensanchar la ventana.
+	//
+	// QUÉ PASA SI SE DESBORDA (medido, y NO es lo que este comentario decía antes):
+	// la entrada que desborda a 4096 no es el CJK —ese cabía, 3.577 tokens— sino el
+	// EMOJI, a 1,0 tok/runa. Y al desbordar la clasificación NO «degrada a desconocido
+	// en silencio»: Ollama descarta la entrada que no cabe (medido: el 58 %) y el
+	// modelo devuelve un intent PLAUSIBLE Y EQUIVOCADO con confianza máxima. En la
+	// medición fue "horario_atencion" con confidence: 100, que ni siquiera el umbral
+	// atrapaba (ver el minimum/maximum de `confidence` en schema.go). Desbordar es un
+	// fallo silencioso y ACTIVO, no una degradación segura: por eso el techo de
+	// entrada se calibra para que no ocurra nunca, en ningún alfabeto.
 	DefaultNumCtx = 4096
 
 	// DefaultNumPredict es el máximo de tokens que el modelo puede generar.
@@ -287,6 +321,10 @@ func (c *Classifier) Classify(ctx context.Context, text string) (Classification,
 
 	// Por debajo del umbral, mejor "desconocido" que una acción equivocada: el
 	// sistema nunca queda peor que el flujo de números.
+	//
+	// Esta comparación solo significa algo porque el schema acota `confidence` a
+	// [0,1] (schema.go): sin ese rango, el modelo puede devolver 100 y ninguna
+	// confianza cae nunca por debajo del umbral. Ya pasó, medido.
 	if out.Confidence < cfg.UmbralConfianza {
 		out.Intent = intents.ReservedUnknown
 		out.Params = nil
