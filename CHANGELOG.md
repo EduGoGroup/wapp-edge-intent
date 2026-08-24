@@ -8,6 +8,81 @@ Todos los cambios notables de `wapp-edge-intent`. El formato sigue
 
 Nada todavía.
 
+## [0.3.0] — 2026-08-24
+
+Versión **menor**: API pública nueva y **estrictamente aditiva**. `ChatRequest`
+gana un campo opcional, `ChatResponse` y `Metrics` ganan uno cada uno, y aparecen
+dos constantes y una función. Un consumidor de `v0.2.0` compila sin tocar una
+línea y —si no fija nada— **manda por el cable exactamente el mismo cuerpo que
+antes**, byte por byte. Verificado compilando el uso real del consumidor
+(`wapp-edge-agent`) contra esta copia: su literal `ollama.ChatRequest{…}` lleva
+claves, así que un campo nuevo no lo rompe.
+
+Plan 044 (carrito LLM), Ola 1.7 · tareas **T1.7-4** y **T1.7-5**. Las dos existen
+para que el Edge Agent pueda hacer su mitad: sin este release no hay dato que
+propagar ni `keep_alive` que mandar.
+
+### Added
+
+- **`ChatRequest.KeepAlive`** (`*int`, segundos) y su clave `keep_alive` en el
+  cuerpo de `/api/chat` (`T1.7-4`). Con `nil` —el default— **no se manda la
+  clave** y decide el servidor (5 min, o lo que diga `OLLAMA_KEEP_ALIVE`).
+  - **Por qué**: cuando el runner de Ollama muere por silencio no se lleva solo
+    el modelo, se lleva **la caché de prefijos** con él. El siguiente mensaje
+    paga carga del modelo (**39 s medidos** el 2026-08-23) **más** el prefill en
+    frío del prompt entero. En el VPS de UAT eso lo tapa hoy
+    `OLLAMA_KEEP_ALIVE=-1` en el env de la unidad, pero eso es una propiedad de
+    **esa** máquina: en el equipo de un cliente no hay quien la ponga, y el campo
+    sí viaja con cada petición.
+  - **Es puntero, no `int`**: para Ollama el cero significa «descarga el modelo
+    en cuanto respondas», que es lo contrario de lo que queremos. Con un `int`
+    desnudo ese cero sería indistinguible de «no lo fijé»; con puntero +
+    `omitempty` se distinguen, porque `omitempty` sobre un puntero omite solo
+    cuando es `nil` (un puntero a `0` sí se serializa).
+  - **Viaja como número (segundos), no como la cadena `"5m"`** que Ollama también
+    acepta: el número lo lee directo —cualquier negativo es «para siempre»—
+    mientras que la cadena pasa por `time.ParseDuration`, y una cadena mal
+    escrita es un `400` que solo aparece en campo. Además el valor nace de una
+    configuración, donde un entero es lo natural.
+  - **No va dentro de `Options`**: `keep_alive` es un campo de primer nivel de
+    `/api/chat`. Metido en `options`, Ollama lo **ignora en silencio** —las
+    claves desconocidas de `options` no dan error— y el modelo seguiría
+    muriéndose sin que nada lo delatara.
+- **`KeepAliveForever` (`-1`)**, la forma canónica de «para siempre», y
+  **`DefaultKeepAliveSeconds`**, el valor que este módulo recomienda al Edge (hoy
+  el mismo `-1`). Son dos constantes a propósito: la primera dice qué
+  **significa** `-1` para Ollama, la segunda qué **elegimos** nosotros, y mañana
+  la política puede bajar a un valor finito sin tocar el significado.
+- **`KeepAliveSeconds(s int) *int`**: envuelve un entero para poder asignarlo al
+  campo. Go no deja tomar la dirección de un literal, y sin esto cada llamador
+  necesitaría una variable temporal.
+- **`ChatResponse.PromptEvalDuration`** (`int64`, ns, clave
+  `prompt_eval_duration`) y su derivado **`Metrics.PromptMs`** (`T1.7-5`). Es el
+  **prefill**: lo que cuesta digerir el prompt de entrada antes de generar el
+  primer token de salida — el gemelo de `EvalDuration`, que mide la
+  **generación**, y ninguno de los dos incluye `LoadDuration` (cargar el modelo).
+  - **Por qué**: Ollama **siempre lo ha devuelto y nosotros lo tirábamos**. Por
+    eso la latencia se publicaba como **un solo número que mezcla dos regímenes
+    separados por un orden de magnitud**: con el prefijo **frío** el prefill
+    cuesta ~**21,6 ms por token**; con el prefijo **caliente** baja a **0,1–1,2 s
+    el prompt entero**. Ese número mezclado es el que dejó **dos p50
+    irreconciliables** en el repo —~20 s en el informe de diseño contra **8,1 s**
+    en campo—: la diferencia no era el modelo ni la máquina, era **el calor del
+    prefijo**.
+  - `PromptMs` se añade a `Metrics` y no solo a la respuesta cruda porque
+    `Metrics` es **la** vista que consume el Edge; dejarlo fuera obligaría a que
+    el mismo log sumara números de dos sitios y en dos unidades.
+
+### Notas de release
+
+- **No** se han creado tags ni tocado versiones en ningún `go.mod`. El corte de
+  `v0.3.0` y la realineación del consumidor (`wapp-edge-agent`, hoy en `v0.2.0`)
+  van por el flujo de release del ecosistema.
+- `classifier.Metrics` (el tipo público del paquete que hoy **nadie llama**;
+  el Edge solo le importa cuatro constantes) **no** gana el prefill: tocarlo
+  quedaba fuera del alcance de la ola. Si ese paquete volviera a la vida, ahí hay
+  un dato que se pierde en la traducción `metricsFrom`.
+
 ## [0.2.0] — 2026-08-16
 
 Versión **menor**, no parche: hay **API pública nueva**. La API es **compatible

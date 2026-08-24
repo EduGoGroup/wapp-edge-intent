@@ -18,9 +18,10 @@ clasificar** (degradación, nunca caída): el LLM solo suma.
 ## Estructura
 
 ```
-ollama/       cliente HTTP de Ollama (Chat con structured outputs, métricas,
-              caché de capabilities, ListModels, Health). Sin timeout global:
-              lo pone el contexto del caller.
+ollama/       cliente HTTP de Ollama (Chat con structured outputs, métricas
+              —prefill y generación por separado—, keep_alive, caché de
+              capabilities, ListModels, Health). Sin timeout global: lo pone el
+              contexto del caller.
 classifier/   Classifier: New(client, model, cfg, opts...) + Reload(cfg) +
               Classify(ctx, text). prompt/schema regenerados desde el contrato de
               intents; sanitizeParams como allowlist real; FastLane para descartar
@@ -112,6 +113,18 @@ Cada uno nace de un fallo observado en el prototipo miniWapp:
 - **Las métricas de Ollama se propagan** en `Classification.Metrics` (también en las
   salidas degradadas): son justo los casos que hay que medir. El log del caller lleva
   `total_ms` y tokens, **nunca el texto clasificado** (INV-051.1).
+- **El prefill se mide APARTE de la generación** (`PromptEvalDuration` /
+  `Metrics.PromptMs`, frente a `EvalDuration`). Un solo número mezcla dos regímenes
+  separados por un orden de magnitud —prefijo frío ~21,6 ms/token contra prefijo
+  caliente 0,1–1,2 s el prompt entero— y esa mezcla es lo que dejó **dos p50
+  irreconciliables** en el repo (~20 s de diseño contra 8,1 s de campo). Publicar el
+  total sin el desglose no es medir, es promediar dos poblaciones distintas.
+- **`keep_alive` va en el primer nivel de `/api/chat`, jamás dentro de `options`**:
+  las claves desconocidas de `options` Ollama las **ignora sin dar error**, así que
+  ahí el campo no protegería nada y nada lo delataría. Y viaja como **número de
+  segundos** (negativo = para siempre), no como cadena `"5m"`: la cadena pasa por
+  `time.ParseDuration` y un texto mal escrito es un `400` que solo se ve en campo.
+  Con `KeepAlive` a `nil` **no se manda la clave** y decide el servidor.
 
 ## Batería de validación
 

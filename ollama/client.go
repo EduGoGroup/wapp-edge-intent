@@ -48,8 +48,28 @@ type Message struct {
 	Content string `json:"content"`
 }
 
-// ChatRequest son los parámetros de una inferencia. Format, Think y Options son
-// opcionales; el clasificador los fija (JSON Schema, think:false, temperatura).
+// KeepAliveForever es el valor de keep_alive que le pide a Ollama mantener el
+// modelo cargado indefinidamente. Ollama trata CUALQUIER número negativo como
+// "para siempre"; -1 es la forma canónica de escribirlo.
+const KeepAliveForever = -1
+
+// DefaultKeepAliveSeconds es el keep_alive que este módulo recomienda al Edge:
+// para siempre. No lo aplica nadie por su cuenta —ChatRequest.KeepAlive sigue
+// siendo opcional— pero da un nombre al número para que el consumidor no lo
+// escriba a ciegas en su configuración. Es una constante aparte de
+// KeepAliveForever a propósito: aquella dice qué SIGNIFICA -1 para Ollama, esta
+// dice qué ELEGIMOS nosotros, y mañana puede bajar a un valor finito sin tocar
+// la otra.
+const DefaultKeepAliveSeconds = KeepAliveForever
+
+// KeepAliveSeconds envuelve s para poder asignarlo a ChatRequest.KeepAlive: Go
+// no deja tomar la dirección de un literal, y sin esto cada llamador tendría que
+// declararse una variable temporal.
+func KeepAliveSeconds(s int) *int { return &s }
+
+// ChatRequest son los parámetros de una inferencia. Format, Think, Options y
+// KeepAlive son opcionales; el clasificador los fija (JSON Schema, think:false,
+// temperatura).
 type ChatRequest struct {
 	Model    string
 	Messages []Message
@@ -58,6 +78,29 @@ type ChatRequest struct {
 	// enviarlo a otros modelos es error de Ollama, por eso es puntero.
 	Think   *bool
 	Options map[string]any
+	// KeepAlive, si no es nil, dice cuántos SEGUNDOS debe Ollama mantener el
+	// modelo en memoria tras responder; KeepAliveForever (-1) = para siempre.
+	// nil = no se manda el campo, y entonces manda lo que tenga configurado el
+	// servidor (por defecto 5 minutos, o lo que diga OLLAMA_KEEP_ALIVE).
+	//
+	// POR QUÉ IMPORTA: cuando el runner muere no se lleva solo el modelo, se
+	// lleva la CACHÉ DE PREFIJOS con él. El siguiente mensaje paga carga del
+	// modelo (39 s medidos el 2026-08-23) MÁS el prefill en frío del prompt
+	// entero. En el VPS de UAT hoy eso lo tapa OLLAMA_KEEP_ALIVE=-1 en el env de
+	// la unidad, pero eso es una propiedad del servidor de ESA máquina: en el
+	// equipo de un cliente no hay nadie que la ponga, y el campo sí viaja con
+	// cada petición.
+	//
+	// ES PUNTERO, NO int: con un int desnudo el valor cero —que para Ollama
+	// significa "descarga el modelo AHORA MISMO"— sería indistinguible de "no lo
+	// fijé". El puntero separa las dos cosas, y omitempty sobre un puntero omite
+	// solo cuando es nil (un puntero a 0 sí se serializa).
+	//
+	// NO VA DENTRO DE Options: keep_alive es un campo de primer nivel de
+	// /api/chat. Metido en options, Ollama lo IGNORA en silencio —las claves
+	// desconocidas de options no dan error— y el modelo seguiría muriéndose sin
+	// que nada lo delate.
+	KeepAlive *int
 }
 
 // chatRequestWire es la forma exacta que espera /api/chat.
@@ -68,6 +111,12 @@ type chatRequestWire struct {
 	Format   json.RawMessage `json:"format,omitempty"`
 	Options  map[string]any  `json:"options,omitempty"`
 	Think    *bool           `json:"think,omitempty"`
+	// keep_alive viaja como NÚMERO (segundos), no como la cadena tipo "5m" que
+	// Ollama también acepta: el número lo lee directo —negativo = para siempre—
+	// mientras que la cadena pasa por time.ParseDuration, y una cadena mal
+	// escrita es un 400 que solo se ve en campo. Además el valor nace de una
+	// configuración, donde un entero es lo natural.
+	KeepAlive *int `json:"keep_alive,omitempty"`
 }
 
 // ChatResponse es la respuesta completa de una inferencia sin streaming.
@@ -80,8 +129,23 @@ type ChatResponse struct {
 	TotalDuration   int64 `json:"total_duration"`
 	LoadDuration    int64 `json:"load_duration"`
 	PromptEvalCount int   `json:"prompt_eval_count"`
-	EvalCount       int   `json:"eval_count"`
-	EvalDuration    int64 `json:"eval_duration"`
+	// PromptEvalDuration es el PREFILL: lo que costó digerir el prompt de
+	// entrada (sus PromptEvalCount tokens) ANTES de generar el primer token de
+	// salida. Es el gemelo de EvalDuration, que mide lo contrario —la
+	// GENERACIÓN de los EvalCount tokens de respuesta—, y ninguno de los dos
+	// incluye LoadDuration (cargar el modelo del disco).
+	//
+	// Ollama siempre lo ha devuelto y nosotros lo tirábamos, y por eso la
+	// latencia se publicaba como UN SOLO NÚMERO que mezcla dos regímenes que se
+	// diferencian en un orden de magnitud: con el prefijo FRÍO el prefill cuesta
+	// ~21,6 ms por token, con el prefijo CALIENTE (la caché de prefijos del
+	// runner viva) baja a 0,1–1,2 s el prompt entero. Ese número mezclado es el
+	// que dejó dos p50 irreconciliables en el repo, ~20 s en el informe de
+	// diseño contra 8,1 s en campo: la diferencia no era el modelo ni la
+	// máquina, era el calor del prefijo.
+	PromptEvalDuration int64 `json:"prompt_eval_duration"`
+	EvalCount          int   `json:"eval_count"`
+	EvalDuration       int64 `json:"eval_duration"`
 }
 
 // Content es el texto generado por el modelo.
@@ -89,8 +153,14 @@ func (r *ChatResponse) Content() string { return r.Message.Content }
 
 // Metrics resume el costo de una inferencia, para evaluar hardware de Edge.
 type Metrics struct {
-	TotalMs      int64   `json:"total_ms"`
-	LoadMs       int64   `json:"load_ms"`
+	TotalMs int64 `json:"total_ms"`
+	LoadMs  int64 `json:"load_ms"`
+	// PromptMs es el prefill en milisegundos (ver ChatResponse.PromptEvalDuration).
+	// Va aquí y no solo en la respuesta cruda porque Metrics es LA vista que
+	// consume el Edge: si el prefill fuera el único dato que hay que ir a buscar
+	// a ChatResponse, el mismo log acabaría sumando números de dos sitios
+	// distintos y en dos unidades distintas.
+	PromptMs     int64   `json:"prompt_ms"`
 	PromptTokens int     `json:"prompt_tokens"`
 	OutputTokens int     `json:"output_tokens"`
 	TokensPerSec float64 `json:"tokens_per_sec"`
@@ -101,6 +171,7 @@ func (r *ChatResponse) Metrics() Metrics {
 	m := Metrics{
 		TotalMs:      r.TotalDuration / int64(time.Millisecond),
 		LoadMs:       r.LoadDuration / int64(time.Millisecond),
+		PromptMs:     r.PromptEvalDuration / int64(time.Millisecond),
 		PromptTokens: r.PromptEvalCount,
 		OutputTokens: r.EvalCount,
 	}
@@ -115,12 +186,13 @@ func (r *ChatResponse) Metrics() Metrics {
 // lo gobierna ctx.
 func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
 	body, err := json.Marshal(chatRequestWire{
-		Model:    req.Model,
-		Messages: req.Messages,
-		Stream:   false,
-		Format:   req.Format,
-		Options:  req.Options,
-		Think:    req.Think,
+		Model:     req.Model,
+		Messages:  req.Messages,
+		Stream:    false,
+		Format:    req.Format,
+		Options:   req.Options,
+		Think:     req.Think,
+		KeepAlive: req.KeepAlive,
 	})
 	if err != nil {
 		return nil, err
